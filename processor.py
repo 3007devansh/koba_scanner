@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
-from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -57,20 +59,24 @@ class Config:
     border_strip_px: int = 15
     """Pixels stripped from each edge before analysis to remove scanner-frame noise."""
 
-    adaptive_block: int = 51
-    """Block size for adaptive thresholding.  Must be odd.  Larger = handles
-    more uneven lighting; smaller = more sensitive to fine strokes."""
+    adaptive_block: int = 41
+    """Block size for adaptive thresholding.  Must be odd.  Smaller (41 vs 51)
+    preserves fine details and handwriting edges better."""
 
-    adaptive_C: int = 15
-    """Constant subtracted in adaptive threshold.  Higher = less noise."""
+    adaptive_C: int = 10
+    """Constant subtracted in adaptive threshold.  Lower (10 vs 15) preserves
+    faint ink that would otherwise be lost."""
 
-    morph_close_kernel: Tuple[int, int] = (7, 3)
-    """Morphological closing kernel (w, h).  Wide kernel joins horizontal strokes
-    (text lines) while keeping vertical noise suppressed."""
+    morph_close_kernel: Tuple[int, int] = (5, 3)
+    """Morphological closing kernel (w, h).  Smaller (5 vs 7) to avoid over-connecting
+    strokes while maintaining horizontal text line cohesion."""
 
-    min_content_fraction: float = 0.03
-    """If the detected content box is smaller than this fraction of the page,
-    assume detection failed and fall back to the full page."""
+    crop_margin_px: int = 20
+    """Pixel margin added around detected content box to preserve edge strokes."""
+
+    min_content_fraction: float = 0.01
+    """If detected content box < 1% of page (was 3%), assume detection failed
+    and fall back to the full page for safety."""
 
     output_format: str = "both"
     """'pdf' | 'images' | 'both'"""
@@ -276,6 +282,7 @@ def find_content_bbox(
     Find the tightest axis-aligned bounding box around all ink content.
 
     Returns (x, y, w, h) without any padding, or None if nothing reliable found.
+    A conservative margin is added around the detected box to preserve edge strokes.
     The 2 cm uniform border is added separately in process_page().
     """
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
@@ -293,10 +300,24 @@ def find_content_bbox(
     if not valid:
         return None
 
+    ink_pixels = np.sum(mask) // 255
+    log.debug(f"    Binary mask: {ink_pixels} ink pixels detected")
+
     all_pts = np.concatenate(valid)
-    x, y, w, h = cv2.boundingRect(all_pts)
+    x_raw, y_raw, w_raw, h_raw = cv2.boundingRect(all_pts)
+    log.debug(f"    Content box (pre-margin): ({x_raw}, {y_raw}, {w_raw}×{h_raw})")
+
+    # Add safety margin to preserve edge content
+    margin = cfg.crop_margin_px
+    x = max(0, x_raw - margin)
+    y = max(0, y_raw - margin)
+    w = min(w_img - x, w_raw + 2 * margin)
+    h = min(h_img - y, h_raw + 2 * margin)
+    
+    log.debug(f"    Content box (post-margin): ({x}, {y}, {w}×{h})")
 
     if (w * h) / total < cfg.min_content_fraction:
+        log.debug(f"    Content fraction {(w * h) / total:.2%} < {cfg.min_content_fraction:.2%}, falling back to full page")
         return None   # caller will fall back to full page
 
     return x, y, w, h
@@ -405,6 +426,32 @@ def assemble_pdf(image_paths: List[str], out_pdf: Path) -> None:
     log.info(f"  PDF assembled → {out_pdf}")
 
 
+# ── multiprocessing worker ────────────────────────────────────────────────────
+
+def _process_page_worker(
+    page_num: int,
+    pil_img: Image.Image,
+    out_dir_str: str,
+    cfg_dict: dict,
+    debug_dir_str: Optional[str],
+) -> PageResult:
+    """
+    Worker function for parallel page processing.  Reconstructs Config from dict
+    (required for pickling across process boundaries) and processes one page.
+    """
+    # Reconstruct Config and Path objects from pickled state
+    cfg = Config(**{k: v for k, v in cfg_dict.items() if k in [
+        'dpi', 'skew_method', 'max_skew_deg', 'padding_cm', 'output_format',
+        'image_format', 'save_debug', 'border_strip_px', 'adaptive_block',
+        'adaptive_C', 'morph_close_kernel', 'crop_margin_px', 'min_content_fraction'
+    ]})
+    
+    out_dir = Path(out_dir_str)
+    debug_dir = Path(debug_dir_str) if debug_dir_str else None
+    
+    return process_page(page_num, pil_img, out_dir, cfg, debug_dir)
+
+
 # ── main orchestrator ─────────────────────────────────────────────────────────
 
 def process_pdf(
@@ -451,11 +498,53 @@ def process_pdf(
     results: List[PageResult] = []
     total = len(pil_pages)
 
-    for i, pil_img in enumerate(pil_pages, start=1):
-        r = process_page(i, pil_img, pages_dir, cfg, debug_dir)
-        results.append(r)
-        if progress_cb:
-            progress_cb(i, total)
+    # Prepare Config for pickling to worker processes
+    cfg_dict = asdict(cfg)
+
+    # Process pages in parallel using all available CPU cores
+    num_workers = os.cpu_count() or 4
+    log.info(f"Using {num_workers} worker process(es)")
+
+    completed_pages = 0
+    try:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {}
+            
+            # Submit all pages to the executor
+            for i, pil_img in enumerate(pil_pages, start=1):
+                fut = executor.submit(
+                    _process_page_worker,
+                    i,
+                    pil_img,
+                    str(pages_dir),
+                    cfg_dict,
+                    str(debug_dir) if debug_dir else None,
+                )
+                futures[fut] = i
+            
+            # Collect results as they complete (not necessarily in order)
+            for fut in as_completed(futures):
+                page_idx = futures[fut]
+                try:
+                    r = fut.result()
+                    results.append(r)
+                    completed_pages += 1
+                    if progress_cb:
+                        progress_cb(completed_pages, total)
+                except Exception as e:
+                    log.error(f"Page {page_idx} processing failed: {e}", exc_info=True)
+                    error_result = PageResult(page_num=page_idx, success=False, error=str(e))
+                    results.append(error_result)
+                    completed_pages += 1
+                    if progress_cb:
+                        progress_cb(completed_pages, total)
+        
+        # Sort results by page number to maintain order
+        results.sort(key=lambda r: r.page_num)
+
+    except Exception as e:
+        log.error(f"Executor error: {e}", exc_info=True)
+        raise
 
     # Output
     ok_paths = [r.output_path for r in results if r.success]

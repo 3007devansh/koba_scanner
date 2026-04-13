@@ -236,6 +236,23 @@ select:focus, input:focus { border-color: #c9542a; }
 .fail { background: #4a1a1a; color: #e06060; }
 
 .hidden { display: none !important; }
+
+/* ── settings collapse ── */
+#settings-toggle {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1rem;
+  margin-left: auto;
+  color: #c9542a;
+  padding: 0;
+  transition: opacity .2s;
+}
+#settings-toggle:hover { opacity: .7; }
+
+#settings-container.collapsed {
+  display: none !important;
+}
 </style>
 </head>
 <body>
@@ -243,8 +260,7 @@ select:focus, input:focus { border-color: #c9542a; }
 <div class="header">
   <div class="header-icon">🏛️</div>
   <div>
-    <h1>Museum Document Scanner</h1>
-    <p>Auto-deskew &amp; autocrop scanned manuscript PDFs — no OCR, uniform 2 cm border</p>
+    <h1>Koba Document scanner</h1>
   </div>
 </div>
 
@@ -263,8 +279,11 @@ select:focus, input:focus { border-color: #c9542a; }
 
   <!-- ── settings ── -->
   <div class="card">
-    <div class="card-title">⚙️ Settings</div>
-    <div class="settings-grid">
+    <div class="card-title" style="display:flex;align-items:center;gap:.5rem">
+      <span>⚙️ Settings</span>
+      <button id="settings-toggle">⚙️</button>
+    </div>
+    <div id="settings-container" class="settings-grid collapsed">
 
       <div>
         <label>Render DPI</label>
@@ -279,8 +298,8 @@ select:focus, input:focus { border-color: #c9542a; }
       <div>
         <label>Skew Detection Method</label>
         <select id="s-method">
-          <option value="hough" selected>Hough Lines — fast, good for text lines</option>
-          <option value="projection">Projection Profile — slow, best for dense handwriting</option>
+          <option value="hough">Hough Lines — fast, good for text lines</option>
+          <option value="projection" selected>Projection Profile — slow, best for dense handwriting</option>
         </select>
       </div>
 
@@ -304,8 +323,8 @@ select:focus, input:focus { border-color: #c9542a; }
       <div>
         <label>Output Format</label>
         <select id="s-outfmt">
-          <option value="both" selected>PDF + individual images</option>
-          <option value="pdf">PDF only</option>
+          <option value="both">PDF + individual images</option>
+          <option value="pdf" selected>PDF only</option>
           <option value="images">Images only</option>
         </select>
       </div>
@@ -319,7 +338,7 @@ select:focus, input:focus { border-color: #c9542a; }
         </select>
       </div>
 
-    </div>
+    </div><!-- /settings-container -->
 
     <div style="margin-top:1.2rem; display:flex; gap:.8rem; align-items:center; flex-wrap:wrap">
       <button class="btn btn-primary" id="run-btn" onclick="startJob()" disabled>
@@ -383,6 +402,20 @@ dz.addEventListener('drop', e => {
 });
 document.getElementById('file-input').addEventListener('change', e => {
   if (e.target.files[0]) pickFile(e.target.files[0]);
+});
+
+// ── settings toggle ────────────────────────────────────────────────────────
+document.getElementById('settings-toggle').addEventListener('click', () => {
+  const container = document.getElementById('settings-container');
+  container.classList.toggle('collapsed');
+});
+
+// On page load, collapse settings by default
+document.addEventListener('DOMContentLoaded', () => {
+  const container = document.getElementById('settings-container');
+  if (container && !container.classList.contains('collapsed')) {
+    container.classList.add('collapsed');
+  }
 });
 
 function pickFile(f) {
@@ -621,10 +654,10 @@ def api_upload():
 
     cfg = Config(
         dpi           = int(request.form.get("dpi", 300)),
-        skew_method   = request.form.get("method", "hough"),
+        skew_method   = request.form.get("method", "projection"),
         max_skew_deg  = float(request.form.get("max_skew", 15)),
         padding_cm    = float(request.form.get("padding_cm", 2.0)),
-        output_format = request.form.get("out_format", "both"),
+        output_format = request.form.get("out_format", "pdf"),
         image_format  = request.form.get("img_format", "png"),
         save_debug    = request.form.get("debug", "0") == "1",
     )
@@ -680,7 +713,7 @@ if __name__ == "__main__":
     import sys
 
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n🏛️  Museum Document Scanner")
+    print(f"\n🏛️  Koba Document scanner")
     print(f"   → http://localhost:{port}\n")
     # use_reloader=False is important when background threads are in play
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
