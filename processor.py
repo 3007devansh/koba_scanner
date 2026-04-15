@@ -1,5 +1,5 @@
 """
-Museum Document Scanner — processor.py
+Koba Document Scanner — processor.py
 =======================================
 Pipeline for each page of a scanned PDF:
   1.  Render page to high-res image
@@ -27,7 +27,7 @@ from typing import List, Optional, Tuple
 import cv2
 import img2pdf
 import numpy as np
-from pdf2image import convert_from_path
+import pypdfium2 as pdfium
 from PIL import Image
 
 # ── logging ───────────────────────────────────────────────────────────────────
@@ -83,6 +83,9 @@ class Config:
 
     image_format: str = "png"
     """'png' | 'jpg' | 'tiff'"""
+
+    jpeg_quality: int = 85
+    """JPEG compression quality (1-100). Lower means smaller file size but more compression artifacts. Only used if image_format is 'jpg'."""
 
     save_debug: bool = False
     """Write intermediate images (binary mask, bbox overlay) to a debug/ folder."""
@@ -402,7 +405,10 @@ def process_page(
         # 6. Save page image
         out_pil = cv_to_pil(padded)
         img_path = out_dir / f"page_{page_num:03d}.{cfg.image_format}"
-        out_pil.save(str(img_path), dpi=(cfg.dpi, cfg.dpi))
+        if cfg.image_format.lower() in ("jpg", "jpeg"):
+            out_pil.save(str(img_path), dpi=(cfg.dpi, cfg.dpi), quality=cfg.jpeg_quality)
+        else:
+            out_pil.save(str(img_path), dpi=(cfg.dpi, cfg.dpi))
         result.output_path = str(img_path)
 
         result.success = True
@@ -442,7 +448,7 @@ def _process_page_worker(
     # Reconstruct Config and Path objects from pickled state
     cfg = Config(**{k: v for k, v in cfg_dict.items() if k in [
         'dpi', 'skew_method', 'max_skew_deg', 'padding_cm', 'output_format',
-        'image_format', 'save_debug', 'border_strip_px', 'adaptive_block',
+        'image_format', 'jpeg_quality', 'save_debug', 'border_strip_px', 'adaptive_block',
         'adaptive_C', 'morph_close_kernel', 'crop_margin_px', 'min_content_fraction'
     ]})
     
@@ -490,9 +496,16 @@ def process_pdf(
     log.info("=" * 55)
 
     # Render PDF pages
-    log.info("Rendering PDF pages…")
+    log.info("Rendering PDF pages via pypdfium2…")
     t0 = time.time()
-    pil_pages = convert_from_path(str(input_path), dpi=cfg.dpi)
+    
+    pil_pages = []
+    pdf_doc = pdfium.PdfDocument(str(input_path))
+    scale = cfg.dpi / 72.0
+    for page in pdf_doc:
+        bitmap = page.render(scale=scale)
+        pil_pages.append(bitmap.to_pil())
+        
     log.info(f"  {len(pil_pages)} page(s) rendered in {time.time() - t0:.1f}s")
 
     results: List[PageResult] = []
@@ -569,7 +582,7 @@ def process_pdf(
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Museum Document Scanner — autocrop & deskew scanned PDFs",
+        description="Koba Document Scanner — autocrop & deskew scanned PDFs",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("input_pdf",   help="Path to the scanned input PDF")
@@ -587,6 +600,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="What to produce")
     p.add_argument("--image-format", choices=["png", "jpg", "tiff"], default="png",
                    help="Format for individual page images")
+    p.add_argument("--jpeg-quality", type=int, default=85,
+                   help="JPEG quality 1-100 (used when image-format is jpg)")
     p.add_argument("--debug", action="store_true",
                    help="Save intermediate binary mask and bounding-box images")
     return p
@@ -601,6 +616,7 @@ def main():
         padding_cm    = args.padding_cm,
         output_format = args.output_format,
         image_format  = args.image_format,
+        jpeg_quality  = args.jpeg_quality,
         save_debug    = args.debug,
     )
     process_pdf(args.input_pdf, args.output_dir, cfg)

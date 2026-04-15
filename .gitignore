@@ -11,3 +11,6 @@ wheels/
 output_dir/
 Sample 2.pdf
 new_trial
+
+deployment_strategies.md
+app.log

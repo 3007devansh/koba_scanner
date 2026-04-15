@@ -1,5 +1,5 @@
 """
-Museum Document Scanner — app.py
+Koba Document Scanner — app.py
 =================================
 Flask web application.  Run:
     python app.py
@@ -35,10 +35,19 @@ from flask import (
 from processor import Config, process_pdf
 
 # ── app setup ─────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024   # 500 MB upload limit
 
-WORK_ROOT = Path(tempfile.mkdtemp(prefix="museum_scanner_"))
+WORK_ROOT = Path(tempfile.mkdtemp(prefix="koba_scanner_"))
 JOBS: dict[str, dict] = {}   # job_id → state dict
 log = logging.getLogger("scanner.web")
 
@@ -51,7 +60,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Museum Document Scanner</title>
+<title>Koba Document Scanner</title>
 <style>
 /* ── reset & base ── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -331,11 +340,19 @@ select:focus, input:focus { border-color: #c9542a; }
 
       <div>
         <label>Image Format</label>
-        <select id="s-imgfmt">
+        <select id="s-imgfmt" onchange="document.getElementById('jpeg-quality-container').style.display = this.value === 'jpg' ? 'block' : 'none'">
           <option value="png" selected>PNG (lossless)</option>
           <option value="jpg">JPEG (smaller)</option>
           <option value="tiff">TIFF (archival)</option>
         </select>
+      </div>
+
+      <div id="jpeg-quality-container" style="display:none">
+        <label>JPEG Quality: <span id="jq-val">85</span>%</label>
+        <div class="range-row">
+          <input type="range" id="s-jq" min="10" max="100" value="85"
+                 oninput="document.getElementById('jq-val').textContent=this.value">
+        </div>
       </div>
 
     </div><!-- /settings-container -->
@@ -449,6 +466,7 @@ async function startJob() {
   fd.append('padding_cm', document.getElementById('s-padding').value);
   fd.append('out_format', document.getElementById('s-outfmt').value);
   fd.append('img_format', document.getElementById('s-imgfmt').value);
+  fd.append('jpeg_quality', document.getElementById('s-jq').value);
   fd.append('debug',      document.getElementById('s-debug').checked ? '1' : '0');
 
   try {
@@ -659,6 +677,7 @@ def api_upload():
         padding_cm    = float(request.form.get("padding_cm", 2.0)),
         output_format = request.form.get("out_format", "pdf"),
         image_format  = request.form.get("img_format", "png"),
+        jpeg_quality  = int(request.form.get("jpeg_quality", 85)),
         save_debug    = request.form.get("debug", "0") == "1",
     )
 
