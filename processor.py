@@ -514,9 +514,11 @@ def process_pdf(
     # Prepare Config for pickling to worker processes
     cfg_dict = asdict(cfg)
 
-    # Process pages in parallel using all available CPU cores
-    num_workers = os.cpu_count() or 4
-    log.info(f"Using {num_workers} worker process(es)")
+    # Process pages in parallel using multiple CPU cores.
+    # We reserve 2 cores for the OS so that other applications remain responsive.
+    total_cores = os.cpu_count() or 4
+    num_workers = max(1, total_cores - 2)
+    log.info(f"Using {num_workers} worker process(es) out of {total_cores} available")
 
     completed_pages = 0
     try:
