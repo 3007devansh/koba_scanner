@@ -100,6 +100,7 @@ class PageResult:
     crop_box: Optional[Tuple[int, int, int, int]] = None  # x, y, w, h (pre-pad)
     output_path: Optional[str] = None
     error: Optional[str] = None
+    messages: Optional[List[str]] = None
 
 
 # ── image helpers ─────────────────────────────────────────────────────────────
@@ -241,7 +242,7 @@ def detect_skew(binary: np.ndarray, cfg: Config) -> float:
     if abs(angle) > cfg.max_skew_deg:
         log.warning(f"    Detected angle {angle:+.1f}° exceeds max — ignoring")
         return 0.0
-    return angle
+    return float(angle)
 
 
 # ── deskew ────────────────────────────────────────────────────────────────────
@@ -282,48 +283,85 @@ def find_content_bbox(
     cv_img: np.ndarray, cfg: Config
 ) -> Optional[Tuple[int, int, int, int]]:
     """
-    Find the tightest axis-aligned bounding box around all ink content.
-
-    Returns (x, y, w, h) without any padding, or None if nothing reliable found.
-    A conservative margin is added around the detected box to preserve edge strokes.
-    The 2 cm uniform border is added separately in process_page().
+    Find the tightest axis-aligned bounding box around all ink content using Connected Components.
     """
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    mask = make_binary_mask(gray, cfg)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
     h_img, w_img = cv_img.shape[:2]
-    total = w_img * h_img
-    min_area = total * 0.0002   # ignore specks smaller than 0.02 % of page
+    page_size = h_img * w_img
 
-    valid = [c for c in contours if cv2.contourArea(c) >= min_area]
-    if not valid:
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    std_gray = np.std(gray)
+
+    lab = cv2.cvtColor(cv_img, cv2.COLOR_BGR2LAB)
+    L, A, B = cv2.split(lab)
+    std_B = np.std(B)
+
+    use_parchment_mode = (std_gray > 25 and std_B > 10)
+
+    if use_parchment_mode:
+        mask = cv2.inRange(B, 140, 255)
+        kernel = np.ones((7, 7), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        # Fill holes
+        flood = mask.copy()
+        ff_mask = np.zeros((h_img + 2, w_img + 2), np.uint8)
+        cv2.floodFill(flood, ff_mask, (0, 0), 255)
+        holes = cv2.bitwise_not(flood)
+        mask = mask | holes
+    else:
+        block = cfg.adaptive_block | 1
+        mask1 = cv2.adaptiveThreshold(L, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block, cfg.adaptive_C)
+        mask2 = cv2.inRange(L, 0, 120)
+        mask = cv2.bitwise_or(mask1, mask2)
+
+        kw, kh = cfg.morph_close_kernel
+        kernel = np.ones((kw, kh), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # Clean edges
+    s = cfg.border_strip_px
+    if s > 0:
+        mask[:s, :]  = 0; mask[-s:, :] = 0
+        mask[:, :s]  = 0; mask[:, -s:] = 0
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    if num_labels <= 1:
         return None
 
-    ink_pixels = np.sum(mask) // 255
-    log.debug(f"    Binary mask: {ink_pixels} ink pixels detected")
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    min_area = page_size * 0.00005
+    valid_idxs = [i for i, a in enumerate(areas) if a >= min_area]
 
-    all_pts = np.concatenate(valid)
-    x_raw, y_raw, w_raw, h_raw = cv2.boundingRect(all_pts)
-    log.debug(f"    Content box (pre-margin): ({x_raw}, {y_raw}, {w_raw}×{h_raw})")
+    if not valid_idxs:
+        return None
+
+    # Keep all valid components to avoid dropping valid outer margins or seals!
+    mask_filtered = np.isin(labels, [i + 1 for i in valid_idxs])
+    ys, xs = np.where(mask_filtered)
+
+    if len(xs) == 0:
+        return None
+
+    x_min, x_max = xs.min(), xs.max()
+    y_min, y_max = ys.min(), ys.max()
 
     # Add safety margin to preserve edge content
     margin = cfg.crop_margin_px
-    x = max(0, x_raw - margin)
-    y = max(0, y_raw - margin)
-    w = min(w_img - x, w_raw + 2 * margin)
-    h = min(h_img - y, h_raw + 2 * margin)
-    
-    log.debug(f"    Content box (post-margin): ({x}, {y}, {w}×{h})")
+    x = int(max(0, x_min - margin))
+    y = int(max(0, y_min - margin))
+    w_box = int(min(w_img - x, (x_max - x_min) + 2 * margin))
+    h_box = int(min(h_img - y, (y_max - y_min) + 2 * margin))
 
-    if (w * h) / total < cfg.min_content_fraction:
-        log.debug(f"    Content fraction {(w * h) / total:.2%} < {cfg.min_content_fraction:.2%}, falling back to full page")
+    area_ratio = float((w_box * h_box) / page_size)
+    mask_coverage = float(np.sum(mask > 0) / page_size)
+
+    if area_ratio < 0.01 or mask_coverage > 0.9:
+        log.debug(f"    Content failed bounds: ratio {area_ratio:.2%}")
         return None   # caller will fall back to full page
 
-    return x, y, w, h
+    return int(x), int(y), int(w_box), int(h_box)
 
 
 def crop_to_content(cv_img: np.ndarray, bbox: Optional[Tuple]) -> np.ndarray:
@@ -357,8 +395,13 @@ def process_page(
     debug_dir: Optional[Path] = None,
 ) -> PageResult:
 
-    result = PageResult(page_num=page_num, success=False)
-    log.info(f"  Page {page_num:>3}: {pil_img.width}×{pil_img.height} px")
+    result = PageResult(page_num=page_num, success=False, messages=[])
+    
+    def _locallog(m):
+        result.messages.append(m)
+        log.info(m)
+
+    _locallog(f"  Page {page_num:>3}: {pil_img.width}×{pil_img.height} px")
 
     try:
         cv_img = pil_to_cv(pil_img)
@@ -376,7 +419,7 @@ def process_page(
         # 2. Skew detection
         angle = detect_skew(mask, cfg)
         result.skew_angle = angle
-        log.info(f"           skew = {angle:+.2f}°  [{cfg.skew_method}]")
+        _locallog(f"           skew = {angle:+.2f}°  [{cfg.skew_method}]")
 
         # 3. Deskew
         deskewed = deskew(cv_img, angle)
@@ -387,9 +430,9 @@ def process_page(
 
         if bbox:
             x, y, w, h = bbox
-            log.info(f"           crop = ({x}, {y}, {w}×{h})")
+            _locallog(f"           crop = ({x}, {y}, {w}×{h})")
         else:
-            log.info(f"           crop = full page (no reliable box found)")
+            _locallog(f"           crop = full page (no reliable box found)")
 
         if cfg.save_debug and debug_dir and bbox:
             overlay = deskewed.copy()
@@ -415,21 +458,23 @@ def process_page(
 
     except Exception as exc:
         result.error = str(exc)
-        log.error(f"  Page {page_num} FAILED: {exc}", exc_info=True)
+        err_msg = f"  Page {page_num} FAILED: {exc}"
+        result.messages.append(err_msg)
+        log.error(err_msg, exc_info=True)
 
     return result
 
 
 # ── PDF assembler ─────────────────────────────────────────────────────────────
 
-def assemble_pdf(image_paths: List[str], out_pdf: Path) -> None:
+def assemble_pdf(image_paths: List[str], out_pdf: Path, jlog=log) -> None:
     valid = [p for p in image_paths if p and Path(p).exists()]
     if not valid:
-        log.error("No valid page images to assemble into PDF.")
+        jlog.error("No valid page images to assemble into PDF.")
         return
     with open(out_pdf, "wb") as fh:
         fh.write(img2pdf.convert(valid))
-    log.info(f"  PDF assembled → {out_pdf}")
+    jlog.info(f"  PDF assembled → {out_pdf}")
 
 
 # ── multiprocessing worker ────────────────────────────────────────────────────
@@ -465,12 +510,31 @@ def process_pdf(
     output_dir: str,
     cfg: Config,
     progress_cb=None,          # optional callable(page_num, total) for GUI
+    job_control=None,          # optional dict for state pause/cancel
+    log_cb=None,               # optional callback for isolated logs
 ) -> List[PageResult]:
     """
     Full pipeline: PDF → cleaned pages → output PDF.
 
     progress_cb is called after each page with (page_num, total_pages).
     """
+    job_control = job_control or {}
+    
+    class _JobLogger:
+        def debug(self, msg): 
+            log.debug(msg)
+            if log_cb: log_cb(msg)
+        def info(self, msg): 
+            log.info(msg)
+            if log_cb: log_cb(msg)
+        def error(self, msg, exc_info=None): 
+            log.error(msg, exc_info=exc_info)
+            if log_cb: log_cb(msg)
+        def warning(self, msg): 
+            log.warning(msg)
+            if log_cb: log_cb(msg)
+            
+    jlog = _JobLogger()
     input_path = Path(input_pdf)
     if not input_path.exists():
         raise FileNotFoundError(f"Input PDF not found: {input_pdf}")
@@ -486,27 +550,37 @@ def process_pdf(
         debug_dir = out_dir / "debug"
         debug_dir.mkdir(exist_ok=True)
 
-    log.info("=" * 55)
-    log.info(f"Input  : {input_path.name}")
-    log.info(f"Output : {out_dir}")
-    log.info(f"DPI    : {cfg.dpi}")
-    log.info(f"Method : {cfg.skew_method}")
+    jlog.info("=" * 55)
+    jlog.info(f"Input  : {input_path.name}")
+    jlog.info(f"Output : {out_dir}")
+    jlog.info(f"DPI    : {cfg.dpi}")
+    jlog.info(f"Method : {cfg.skew_method}")
     pad_px = cm_to_px(cfg.padding_cm, cfg.dpi)
-    log.info(f"Padding: {cfg.padding_cm} cm  ({pad_px} px at {cfg.dpi} dpi)")
-    log.info("=" * 55)
+    jlog.info(f"Padding: {cfg.padding_cm} cm  ({pad_px} px at {cfg.dpi} dpi)")
+    jlog.info("=" * 55)
 
     # Render PDF pages
-    log.info("Rendering PDF pages via pypdfium2…")
+    jlog.info("Rendering PDF pages via pypdfium2…")
     t0 = time.time()
     
     pil_pages = []
     pdf_doc = pdfium.PdfDocument(str(input_path))
     scale = cfg.dpi / 72.0
     for page in pdf_doc:
+        state = job_control.get("state", "running")
+        if state == "cancelled":
+            jlog.warning("Job cancelled during PDF rendering.")
+            return []
+        while job_control.get("state") == "paused":
+            time.sleep(0.5)
+            if job_control.get("state") == "cancelled":
+                jlog.warning("Job cancelled during PDF rendering.")
+                return []
+                
         bitmap = page.render(scale=scale)
         pil_pages.append(bitmap.to_pil())
         
-    log.info(f"  {len(pil_pages)} page(s) rendered in {time.time() - t0:.1f}s")
+    jlog.info(f"  {len(pil_pages)} page(s) rendered in {time.time() - t0:.1f}s")
 
     results: List[PageResult] = []
     total = len(pil_pages)
@@ -514,68 +588,96 @@ def process_pdf(
     # Prepare Config for pickling to worker processes
     cfg_dict = asdict(cfg)
 
+    from concurrent.futures import FIRST_COMPLETED, wait
+
     # Process pages in parallel using multiple CPU cores.
-    # We reserve 2 cores for the OS so that other applications remain responsive.
     total_cores = os.cpu_count() or 4
     num_workers = max(1, total_cores - 2)
-    log.info(f"Using {num_workers} worker process(es) out of {total_cores} available")
+    jlog.info(f"Using {num_workers} worker process(es) out of {total_cores} available")
 
     completed_pages = 0
     try:
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = {}
+            active_futures = {}
+            pages_iter = enumerate(pil_pages, start=1)
+
+            def submit_more():
+                while len(active_futures) < num_workers:
+                    try:
+                        i, pil_img = next(pages_iter)
+                        fut = executor.submit(
+                            _process_page_worker,
+                            i,
+                            pil_img,
+                            str(pages_dir),
+                            cfg_dict,
+                            str(debug_dir) if debug_dir else None,
+                        )
+                        active_futures[fut] = i
+                    except StopIteration:
+                        break
             
-            # Submit all pages to the executor
-            for i, pil_img in enumerate(pil_pages, start=1):
-                fut = executor.submit(
-                    _process_page_worker,
-                    i,
-                    pil_img,
-                    str(pages_dir),
-                    cfg_dict,
-                    str(debug_dir) if debug_dir else None,
-                )
-                futures[fut] = i
+            submit_more()
             
-            # Collect results as they complete (not necessarily in order)
-            for fut in as_completed(futures):
-                page_idx = futures[fut]
-                try:
-                    r = fut.result()
-                    results.append(r)
-                    completed_pages += 1
-                    if progress_cb:
-                        progress_cb(completed_pages, total)
-                except Exception as e:
-                    log.error(f"Page {page_idx} processing failed: {e}", exc_info=True)
-                    error_result = PageResult(page_num=page_idx, success=False, error=str(e))
-                    results.append(error_result)
-                    completed_pages += 1
-                    if progress_cb:
-                        progress_cb(completed_pages, total)
+            # Collect results as they complete, parsing job state dynamically
+            while active_futures:
+                done, _ = wait(active_futures.keys(), return_when=FIRST_COMPLETED, timeout=0.5)
+                
+                state = job_control.get("state", "running")
+                if state == "cancelled":
+                    jlog.warning("Job cancelled. Stopping workers...")
+                    for f in active_futures.keys():
+                        f.cancel()
+                    break
+
+                for fut in done:
+                    page_idx = active_futures.pop(fut)
+                    try:
+                        r = fut.result()
+                        results.append(r)
+                        
+                        # Emit the child pages' logs linearly so UI receives them cleanly
+                        if r.messages:
+                            for msg in r.messages:
+                                jlog.info(msg)
+                                
+                        completed_pages += 1
+                        if progress_cb:
+                            progress_cb(completed_pages, total)
+                    except Exception as e:
+                        jlog.error(f"Page {page_idx} processing failed: {e}", exc_info=True)
+                        error_result = PageResult(page_num=page_idx, success=False, error=str(e))
+                        results.append(error_result)
+                        completed_pages += 1
+                        if progress_cb:
+                            progress_cb(completed_pages, total)
+                
+                # Check paused state before pushing more work to workers
+                if job_control.get("state", "running") == "running":
+                    submit_more()
         
         # Sort results by page number to maintain order
         results.sort(key=lambda r: r.page_num)
 
     except Exception as e:
-        log.error(f"Executor error: {e}", exc_info=True)
+        jlog.error(f"Executor error: {e}", exc_info=True)
         raise
 
     # Output
     ok_paths = [r.output_path for r in results if r.success]
 
-    if cfg.output_format in ("pdf", "both"):
+    if cfg.output_format in ("pdf", "both") and ok_paths:
         out_pdf = out_dir / f"{input_path.stem}_cleaned.pdf"
-        assemble_pdf(ok_paths, out_pdf)
+        assemble_pdf(ok_paths, out_pdf, jlog)
 
     # Summary
     ok_count = sum(1 for r in results if r.success)
-    log.info("-" * 55)
-    log.info(f"Done — {ok_count}/{total} pages OK")
+    jlog.info("-" * 55)
+    jlog.info(f"Done — {ok_count}/{total} pages OK")
     for r in results:
         mark = "✓" if r.success else "✗"
         detail = f"skew {r.skew_angle:+.2f}°" if r.success else (r.error or "")
-        log.info(f"  {mark} Page {r.page_num:>3}  {detail}")
+        jlog.info(f"  {mark} Page {r.page_num:>3}  {detail}")
 
     return results
 

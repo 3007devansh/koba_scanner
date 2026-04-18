@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
+import queue
 from pathlib import Path
 
 from flask import (
@@ -50,6 +51,26 @@ app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024   # 500 MB upload limit
 WORK_ROOT = Path(tempfile.mkdtemp(prefix="koba_scanner_"))
 JOBS: dict[str, dict] = {}   # job_id → state dict
 log = logging.getLogger("scanner.web")
+
+job_queue = queue.Queue()
+
+def _worker_loop():
+    while True:
+        job_id = job_queue.get()
+        if job_id is None:
+            break
+        try:
+            if JOBS[job_id].get("state") == "cancelled":
+                continue
+            _run_job_sync(job_id)
+        except Exception as e:
+            log.error(f"Job {job_id} failed: {e}")
+            JOBS[job_id]["state"] = "error"
+            JOBS[job_id]["error"] = str(e)
+        finally:
+            job_queue.task_done()
+
+threading.Thread(target=_worker_loop, daemon=True).start()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -373,6 +394,11 @@ select:focus, input:focus { border-color: #c9542a; }
     <div class="status-line">
       <span class="spin" id="spin"></span>
       <span id="status-text">Starting…</span>
+      <div style="margin-left:auto; display:flex; gap:0.5rem">
+        <button class="btn" id="btn-pause" onclick="jobAction('pause')" style="padding:0.4rem 0.8rem; font-size:0.8rem">⏸ Pause</button>
+        <button class="btn" id="btn-resume" onclick="jobAction('resume')" style="display:none; padding:0.4rem 0.8rem; font-size:0.8rem">▶ Resume</button>
+        <button class="btn" id="btn-cancel" onclick="jobAction('cancel')" style="padding:0.4rem 0.8rem; font-size:0.8rem; background:#4a1a1a;">⏹ Cancel</button>
+      </div>
     </div>
     <div class="progress-wrap">
       <div class="progress-fill" id="pbar"></div>
@@ -484,6 +510,25 @@ async function startJob() {
 function startPolling(jobId) {
   if (pollId) clearInterval(pollId);
   pollId = setInterval(() => pollJob(jobId), 1200);
+  
+  // reset buttons
+  document.getElementById('btn-pause').style.display = 'inline-flex';
+  document.getElementById('btn-resume').style.display = 'none';
+  document.getElementById('btn-cancel').style.display = 'inline-flex';
+}
+
+async function jobAction(action) {
+  if (!activeJobId) return;
+  try {
+    const res = await fetch('/api/action/' + activeJobId, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action})
+    });
+    if (!res.ok) console.error(await res.text());
+  } catch(err) {
+    console.error(err);
+  }
 }
 
 async function pollJob(jobId) {
@@ -491,7 +536,7 @@ async function pollJob(jobId) {
     const res  = await fetch('/api/status/' + jobId);
     const data = await res.json();
     applyStatus(data, jobId);
-    if (data.state === 'done' || data.state === 'error') {
+    if (data.state === 'done' || data.state === 'error' || data.state === 'cancelled') {
       clearInterval(pollId);
     }
   } catch (_) { /* transient network error, retry next tick */ }
@@ -505,23 +550,45 @@ function applyStatus(data, jobId) {
     lb.scrollTop = lb.scrollHeight;
   }
 
-  if (data.state === 'running') {
+  if (data.state === 'queued') {
+    document.getElementById('status-text').textContent = 'Waiting in queue…';
+  } else if (data.state === 'running') {
     const pct = Math.min(90, 5 + (data.done_pages || 0) / Math.max(data.total_pages || 1, 1) * 85);
     document.getElementById('pbar').style.width = pct + '%';
     document.getElementById('status-text').textContent =
       `Processing page ${data.done_pages || 0} / ${data.total_pages || '?'}…`;
-
+    document.getElementById('btn-pause').style.display = 'inline-flex';
+    document.getElementById('btn-resume').style.display = 'none';
+    document.getElementById('spin').style.display = 'inline-block';
+  } else if (data.state === 'paused') {
+    document.getElementById('status-text').textContent = 'Paused';
+    document.getElementById('btn-pause').style.display = 'none';
+    document.getElementById('btn-resume').style.display = 'inline-flex';
+    document.getElementById('spin').style.display = 'none';
+  } else if (data.state === 'cancelled') {
+    document.getElementById('status-text').textContent = '❌  Cancelled';
+    document.getElementById('btn-pause').style.display = 'none';
+    document.getElementById('btn-resume').style.display = 'none';
+    document.getElementById('btn-cancel').style.display = 'none';
+    document.getElementById('run-btn').disabled = false;
+    document.getElementById('spin').style.display = 'none';
   } else if (data.state === 'done') {
     document.getElementById('pbar').style.width = '100%';
     document.getElementById('spin').style.display = 'none';
     document.getElementById('status-text').textContent = '✅  Done!';
     document.getElementById('run-btn').disabled = false;
+    document.getElementById('btn-pause').style.display = 'none';
+    document.getElementById('btn-resume').style.display = 'none';
+    document.getElementById('btn-cancel').style.display = 'none';
     showResults(data, jobId);
 
   } else if (data.state === 'error') {
     document.getElementById('spin').style.display = 'none';
     document.getElementById('status-text').textContent = '❌  ' + (data.error || 'Unknown error');
     document.getElementById('run-btn').disabled = false;
+    document.getElementById('btn-pause').style.display = 'none';
+    document.getElementById('btn-resume').style.display = 'none';
+    document.getElementById('btn-cancel').style.display = 'none';
   }
 }
 
@@ -587,31 +654,37 @@ function showError(msg) {
 # Background job
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_job(job_id: str, pdf_path: str, out_dir: str, cfg: Config) -> None:
+def _run_job_sync(job_id: str) -> None:
     job = JOBS[job_id]
+    if job.get("state") == "cancelled":
+        return
     job["state"] = "running"
+    
     log_lines: list[str] = []
 
-    # Capture the scanner logger into a list so the UI can poll it
-    class _ListHandler(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            log_lines.append(self.format(record))
-            job["log"] = log_lines[-120:]
-
-    handler = _ListHandler()
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    scanner_log = logging.getLogger("scanner")
-    scanner_log.addHandler(handler)
+    def log_cb(msg: str) -> None:
+        log_lines.append(msg)
+        job["log"] = log_lines[-120:]
 
     def progress_cb(done: int, total: int) -> None:
         job["done_pages"]  = done
         job["total_pages"] = total
 
     try:
-        results = process_pdf(pdf_path, out_dir, cfg, progress_cb=progress_cb)
+        results = process_pdf(
+            job["pdf_path"], 
+            job["out_dir"], 
+            job["cfg"], 
+            progress_cb=progress_cb,
+            job_control=job,
+            log_cb=log_cb
+        )
+
+        if job.get("state") == "cancelled":
+            return
 
         # Find output PDF
-        out_pdf = next(Path(out_dir).glob("*_cleaned.pdf"), None)
+        out_pdf = next(Path(job["out_dir"]).glob("*_cleaned.pdf"), None)
 
         job.update(
             state        = "done",
@@ -636,9 +709,6 @@ def _run_job(job_id: str, pdf_path: str, out_dir: str, cfg: Config) -> None:
         job.update(state="error", error=str(exc))
         log_lines.append(traceback.format_exc())
         job["log"] = log_lines[-120:]
-
-    finally:
-        scanner_log.removeHandler(handler)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -686,17 +756,35 @@ def api_upload():
         "done_pages":  0,
         "total_pages": 0,
         "log":         [],
+        "pdf_path":    str(pdf_path),
+        "out_dir":     out_dir,
+        "cfg":         cfg,
     }
 
-    t = threading.Thread(
-        target=_run_job,
-        args=(job_id, str(pdf_path), out_dir, cfg),
-        daemon=True,
-    )
-    t.start()
+    job_queue.put(job_id)
 
     return jsonify(job_id=job_id)
 
+
+@app.route("/api/action/<job_id>", methods=["POST"])
+def api_action(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        return jsonify(error="Job not found"), 404
+    
+    action = request.json.get("action")
+    if action == "pause":
+        if job["state"] == "running":
+            job["state"] = "paused"
+    elif action == "resume":
+        if job["state"] == "paused":
+            job["state"] = "running"
+    elif action == "cancel":
+        if job["state"] in ("queued", "running", "paused"):
+            job["state"] = "cancelled"
+            job["log"].append("Job cancelled by user.")
+            
+    return jsonify(ok=True, state=job["state"])
 
 @app.route("/api/status/<job_id>")
 def api_status(job_id: str):
@@ -732,7 +820,7 @@ if __name__ == "__main__":
     import sys
 
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n🏛️  Koba Document scanner")
-    print(f"   → http://localhost:{port}\n")
+    print(f"\n[Koba] Document scanner")
+    print(f"   -> http://localhost:{port}\n")
     # use_reloader=False is important when background threads are in play
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
