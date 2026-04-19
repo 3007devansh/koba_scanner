@@ -279,89 +279,64 @@ def deskew(cv_img: np.ndarray, angle: float) -> np.ndarray:
 
 # ── autocrop ──────────────────────────────────────────────────────────────────
 
+def make_lab_mask(img: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    L, A, B = cv2.split(lab)
+    # B > 135 effectively targets yellow/brown hues of aging parchment
+    mask = cv2.inRange(B, 135, 255)
+    kernel = np.ones((21, 21), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
+def make_hsv_mask(img: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    _, S, _ = cv2.split(hsv)
+    # Saturation threshold isolates colored objects from gray backgrounds
+    blurred = cv2.GaussianBlur(S, (11, 11), 0)
+    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = np.ones((21, 21), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
 def find_content_bbox(
     cv_img: np.ndarray, cfg: Config
 ) -> Optional[Tuple[int, int, int, int]]:
     """
-    Find the tightest axis-aligned bounding box around all ink content using Connected Components.
+    Find bounding box using Contour method on an HSV mask (with LAB fallback).
     """
     h_img, w_img = cv_img.shape[:2]
     page_size = h_img * w_img
 
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    std_gray = np.std(gray)
+    mask_hsv = make_hsv_mask(cv_img)
+    mask = mask_hsv
+    
+    # Extract contour
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Fallback to LAB if HSV contour fails or if area is extremely small
+    valid = [c for c in contours if 0.005 < (cv2.contourArea(c) / page_size) < 0.98]
+    
+    if not valid:
+        # Fallback triggered
+        mask_lab = make_lab_mask(cv_img)
+        mask = mask_lab
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid = [c for c in contours if 0.005 < (cv2.contourArea(c) / page_size) < 0.98]
 
-    lab = cv2.cvtColor(cv_img, cv2.COLOR_BGR2LAB)
-    L, A, B = cv2.split(lab)
-    std_B = np.std(B)
-
-    use_parchment_mode = (std_gray > 25 and std_B > 10)
-
-    if use_parchment_mode:
-        mask = cv2.inRange(B, 140, 255)
-        kernel = np.ones((7, 7), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-        # Fill holes
-        flood = mask.copy()
-        ff_mask = np.zeros((h_img + 2, w_img + 2), np.uint8)
-        cv2.floodFill(flood, ff_mask, (0, 0), 255)
-        holes = cv2.bitwise_not(flood)
-        mask = mask | holes
-    else:
-        block = cfg.adaptive_block | 1
-        mask1 = cv2.adaptiveThreshold(L, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block, cfg.adaptive_C)
-        mask2 = cv2.inRange(L, 0, 120)
-        mask = cv2.bitwise_or(mask1, mask2)
-
-        kw, kh = cfg.morph_close_kernel
-        kernel = np.ones((kw, kh), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    # Clean edges
-    s = cfg.border_strip_px
-    if s > 0:
-        mask[:s, :]  = 0; mask[-s:, :] = 0
-        mask[:, :s]  = 0; mask[:, -s:] = 0
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
-    if num_labels <= 1:
+    if not valid:
         return None
 
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    min_area = page_size * 0.00005
-    valid_idxs = [i for i, a in enumerate(areas) if a >= min_area]
-
-    if not valid_idxs:
-        return None
-
-    # Keep all valid components to avoid dropping valid outer margins or seals!
-    mask_filtered = np.isin(labels, [i + 1 for i in valid_idxs])
-    ys, xs = np.where(mask_filtered)
-
-    if len(xs) == 0:
-        return None
-
-    x_min, x_max = xs.min(), xs.max()
-    y_min, y_max = ys.min(), ys.max()
-
+    cnt = max(valid, key=cv2.contourArea)
+    x_min, y_min, w_cnt, h_cnt = cv2.boundingRect(cnt)
+    
     # Add safety margin to preserve edge content
     margin = cfg.crop_margin_px
     x = int(max(0, x_min - margin))
     y = int(max(0, y_min - margin))
-    w_box = int(min(w_img - x, (x_max - x_min) + 2 * margin))
-    h_box = int(min(h_img - y, (y_max - y_min) + 2 * margin))
+    w_box = int(min(w_img - x, w_cnt + 2 * margin))
+    h_box = int(min(h_img - y, h_cnt + 2 * margin))
 
-    area_ratio = float((w_box * h_box) / page_size)
-    mask_coverage = float(np.sum(mask > 0) / page_size)
-
-    if area_ratio < 0.01 or mask_coverage > 0.9:
-        log.debug(f"    Content failed bounds: ratio {area_ratio:.2%}")
-        return None   # caller will fall back to full page
-
-    return int(x), int(y), int(w_box), int(h_box)
+    return x, y, w_box, h_box
 
 
 def crop_to_content(cv_img: np.ndarray, bbox: Optional[Tuple]) -> np.ndarray:
