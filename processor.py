@@ -300,9 +300,9 @@ def make_hsv_mask(img: np.ndarray) -> np.ndarray:
 
 def find_content_bbox(
     cv_img: np.ndarray, cfg: Config
-) -> Optional[Tuple[int, int, int, int]]:
+) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[np.ndarray]]:
     """
-    Find bounding box using Contour method on an HSV mask (with LAB fallback).
+    Find bounding box and convex hull using Contour method on an HSV mask (with LAB fallback).
     """
     h_img, w_img = cv_img.shape[:2]
     page_size = h_img * w_img
@@ -324,10 +324,11 @@ def find_content_bbox(
         valid = [c for c in contours if 0.005 < (cv2.contourArea(c) / page_size) < 0.98]
 
     if not valid:
-        return None
+        return None, None
 
     cnt = max(valid, key=cv2.contourArea)
-    x_min, y_min, w_cnt, h_cnt = cv2.boundingRect(cnt)
+    hull = cv2.convexHull(cnt)
+    x_min, y_min, w_cnt, h_cnt = cv2.boundingRect(hull)
     
     # Add safety margin to preserve edge content
     margin = cfg.crop_margin_px
@@ -336,14 +337,24 @@ def find_content_bbox(
     w_box = int(min(w_img - x, w_cnt + 2 * margin))
     h_box = int(min(h_img - y, h_cnt + 2 * margin))
 
-    return x, y, w_box, h_box
+    return (x, y, w_box, h_box), hull
 
     
-def crop_to_content(cv_img: np.ndarray, bbox: Optional[Tuple]) -> np.ndarray:
+def crop_to_content(cv_img: np.ndarray, bbox: Optional[Tuple], hull: Optional[np.ndarray] = None) -> np.ndarray:
     if bbox is None:
         return cv_img
     x, y, w, h = bbox
-    return cv_img[y : y + h, x : x + w]
+    cropped = cv_img[y : y + h, x : x + w].copy()
+    
+    if hull is not None:
+        mask = np.zeros((h, w), dtype=np.uint8)
+        local_hull = hull.copy()
+        local_hull[:, 0, 0] -= x
+        local_hull[:, 0, 1] -= y
+        cv2.drawContours(mask, [local_hull], -1, 255, thickness=cv2.FILLED)
+        cropped[mask == 0] = [255, 255, 255]
+        
+    return cropped
 
 
 # ── uniform border ────────────────────────────────────────────────────────────
@@ -399,8 +410,8 @@ def process_page(
         # 3. Deskew
         deskewed = deskew(cv_img, angle)
 
-        # 4. Autocrop — find content bounding box on the DESKEWED image
-        bbox = find_content_bbox(deskewed, cfg)
+        # 4. Autocrop — find content bounding box and hull on the DESKEWED image
+        bbox, hull = find_content_bbox(deskewed, cfg)
         result.crop_box = bbox
 
         if bbox:
@@ -413,9 +424,11 @@ def process_page(
             overlay = deskewed.copy()
             x, y, w, h = bbox
             cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 200, 0), 4)
+            if hull is not None:
+                cv2.drawContours(overlay, [hull], -1, (0, 0, 255), 2)
             cv2.imwrite(str(debug_dir / f"p{page_num:03d}_2_bbox.png"), overlay)
 
-        cropped = crop_to_content(deskewed, bbox)
+        cropped = crop_to_content(deskewed, bbox, hull)
 
         # 5. Add uniform 2 cm white border
         padded = add_uniform_border(cropped, cfg)
