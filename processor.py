@@ -98,6 +98,8 @@ class PageResult:
     success: bool
     skew_angle: float = 0.0
     crop_box: Optional[Tuple[int, int, int, int]] = None  # x, y, w, h (pre-pad)
+    crop_w: int = 0
+    crop_h: int = 0
     output_path: Optional[str] = None
     error: Optional[str] = None
     messages: Optional[List[str]] = None
@@ -370,6 +372,46 @@ def add_uniform_border(cv_img: np.ndarray, cfg: Config) -> np.ndarray:
         cv2.BORDER_CONSTANT, value=(255, 255, 255),
     )
 
+def finalize_page(
+    page_num: int,
+    temp_path: Path,
+    out_dir: Path,
+    max_w: int,
+    max_h: int,
+    cfg: Config
+) -> str:
+    """Read temp cropped image, pad to max_w/max_h, add uniform border, save final."""
+    cropped = cv2.imread(str(temp_path))
+    if cropped is None:
+        raise ValueError(f"Could not read temp file: {temp_path}")
+    h, w = cropped.shape[:2]
+    
+    # Pad to max_w, max_h (centered)
+    pad_top = max(0, (max_h - h) // 2)
+    pad_bottom = max(0, max_h - h - pad_top)
+    pad_left = max(0, (max_w - w) // 2)
+    pad_right = max(0, max_w - w - pad_left)
+    
+    uniform_cropped = cv2.copyMakeBorder(
+        cropped, pad_top, pad_bottom, pad_left, pad_right,
+        cv2.BORDER_CONSTANT, value=(255, 255, 255)
+    )
+    
+    # Add the configured uniform padding
+    padded = add_uniform_border(uniform_cropped, cfg)
+    
+    # Save final
+    out_pil = cv_to_pil(padded)
+    img_path = out_dir / f"page_{page_num:03d}.{cfg.image_format}"
+    if cfg.image_format.lower() in ("jpg", "jpeg"):
+        out_pil.save(str(img_path), dpi=(cfg.dpi, cfg.dpi), quality=cfg.jpeg_quality)
+    else:
+        out_pil.save(str(img_path), dpi=(cfg.dpi, cfg.dpi))
+        
+    # Delete temp file
+    temp_path.unlink(missing_ok=True)
+    
+    return str(img_path)
 
 # ── per-page pipeline ─────────────────────────────────────────────────────────
 
@@ -430,17 +472,13 @@ def process_page(
 
         cropped = crop_to_content(deskewed, bbox, hull)
 
-        # 5. Add uniform 2 cm white border
-        padded = add_uniform_border(cropped, cfg)
+        result.crop_w = cropped.shape[1]
+        result.crop_h = cropped.shape[0]
 
-        # 6. Save page image
-        out_pil = cv_to_pil(padded)
-        img_path = out_dir / f"page_{page_num:03d}.{cfg.image_format}"
-        if cfg.image_format.lower() in ("jpg", "jpeg"):
-            out_pil.save(str(img_path), dpi=(cfg.dpi, cfg.dpi), quality=cfg.jpeg_quality)
-        else:
-            out_pil.save(str(img_path), dpi=(cfg.dpi, cfg.dpi))
-        result.output_path = str(img_path)
+        # Save intermediate lossless crop
+        temp_path = out_dir / f"p{page_num:03d}_crop.png"
+        cv2.imwrite(str(temp_path), cropped)
+        result.output_path = str(temp_path)
 
         result.success = True
 
@@ -585,7 +623,7 @@ def process_pdf(
     # Process pages in parallel — use all available cores minus 2 to keep
     # the system responsive while still maximising throughput.
     total_cores = os.cpu_count() or 4
-    num_workers = max(1, total_cores - 2)
+    num_workers = max(1, total_cores - 3)
     jlog.info(f"Using {num_workers} worker process(es) out of {total_cores} available")
 
     completed_pages = 0
@@ -655,6 +693,32 @@ def process_pdf(
     except Exception as e:
         jlog.error(f"Executor error: {e}", exc_info=True)
         raise
+
+    # ── Phase 2: Uniform Resizing ──
+    successful_results = [r for r in results if r.success]
+    if successful_results:
+        max_w = max(r.crop_w for r in successful_results)
+        max_h = max(r.crop_h for r in successful_results)
+        jlog.info(f"Normalising all pages to largest crop size: {max_w}x{max_h} px")
+        
+        for r in successful_results:
+            state = job_control.get("state", "running")
+            if state == "cancelled":
+                break
+                
+            if r.output_path and Path(r.output_path).exists():
+                try:
+                    final_path = finalize_page(
+                        r.page_num,
+                        Path(r.output_path),
+                        pages_dir,
+                        max_w, max_h, cfg
+                    )
+                    r.output_path = final_path
+                except Exception as e:
+                    jlog.error(f"Failed to finalize page {r.page_num}: {e}")
+                    r.success = False
+                    r.error = str(e)
 
     # Output
     ok_paths = [r.output_path for r in results if r.success]
