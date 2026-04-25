@@ -7,7 +7,7 @@ Pipeline for each page of a scanned PDF:
   3.  Detect skew angle  (Hough lines  OR  Projection profile)
   4.  Deskew — rotate so text runs perfectly horizontal
   5.  Autocrop — find the tightest bounding box around all ink
-  6.  Add a uniform 2 cm white border on all four sides
+  6.  Add a uniform white border on all four sides (default 10 mm)
   7.  Export each page as PNG + reassemble into a clean PDF
 
 No OCR is performed.
@@ -45,15 +45,15 @@ class Config:
     dpi: int = 300
     """Render resolution.  300 is the safe minimum; 400 for small handwriting."""
 
-    skew_method: str = "hough"
+    skew_method: str = "projection"
     """'hough' (fast, good for ruled/printed) or 'projection' (slow, best for
     dense handwriting without clear baselines)."""
 
     max_skew_deg: float = 15.0
     """Angles larger than this are almost certainly wrong detections — ignored."""
 
-    padding_cm: float = 2.0
-    """Uniform white border added to every side of the cropped content (cm)."""
+    padding_mm: float = 10.0
+    """Uniform white border added to every side of the cropped content (mm)."""
 
     # ── internal tuning ───────────────────────────────────────────────────────
     border_strip_px: int = 15
@@ -78,10 +78,10 @@ class Config:
     """If detected content box < 1% of page (was 3%), assume detection failed
     and fall back to the full page for safety."""
 
-    output_format: str = "both"
+    output_format: str = "pdf"
     """'pdf' | 'images' | 'both'"""
 
-    image_format: str = "png"
+    image_format: str = "jpg"
     """'png' | 'jpg' | 'tiff'"""
 
     jpeg_quality: int = 85
@@ -113,9 +113,9 @@ def cv_to_pil(img: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
 
-def cm_to_px(cm: float, dpi: int) -> int:
-    """Convert centimetres to pixels at the given DPI."""
-    return int(round(cm * dpi / 2.54))
+def mm_to_px(mm: float, dpi: int) -> int:
+    """Convert millimetres to pixels at the given DPI."""
+    return int(round(mm * dpi / 25.4))
 
 
 # ── binary content mask ───────────────────────────────────────────────────────
@@ -338,7 +338,7 @@ def find_content_bbox(
 
     return x, y, w_box, h_box
 
-
+    
 def crop_to_content(cv_img: np.ndarray, bbox: Optional[Tuple]) -> np.ndarray:
     if bbox is None:
         return cv_img
@@ -350,10 +350,10 @@ def crop_to_content(cv_img: np.ndarray, bbox: Optional[Tuple]) -> np.ndarray:
 
 def add_uniform_border(cv_img: np.ndarray, cfg: Config) -> np.ndarray:
     """
-    Add a uniform white border of exactly cfg.padding_cm centimetres
+    Add a uniform white border of exactly cfg.padding_mm millimetres
     on all four sides, computed from cfg.dpi so the physical size is exact.
     """
-    pad = cm_to_px(cfg.padding_cm, cfg.dpi)
+    pad = mm_to_px(cfg.padding_mm, cfg.dpi)
     return cv2.copyMakeBorder(
         cv_img, pad, pad, pad, pad,
         cv2.BORDER_CONSTANT, value=(255, 255, 255),
@@ -467,7 +467,7 @@ def _process_page_worker(
     """
     # Reconstruct Config and Path objects from pickled state
     cfg = Config(**{k: v for k, v in cfg_dict.items() if k in [
-        'dpi', 'skew_method', 'max_skew_deg', 'padding_cm', 'output_format',
+        'dpi', 'skew_method', 'max_skew_deg', 'padding_mm', 'output_format',
         'image_format', 'jpeg_quality', 'save_debug', 'border_strip_px', 'adaptive_block',
         'adaptive_C', 'morph_close_kernel', 'crop_margin_px', 'min_content_fraction'
     ]})
@@ -487,6 +487,7 @@ def process_pdf(
     progress_cb=None,          # optional callable(page_num, total) for GUI
     job_control=None,          # optional dict for state pause/cancel
     log_cb=None,               # optional callback for isolated logs
+    output_stem: Optional[str] = None,  # override output filename stem (uses input stem if None)
 ) -> List[PageResult]:
     """
     Full pipeline: PDF → cleaned pages → output PDF.
@@ -530,8 +531,8 @@ def process_pdf(
     jlog.info(f"Output : {out_dir}")
     jlog.info(f"DPI    : {cfg.dpi}")
     jlog.info(f"Method : {cfg.skew_method}")
-    pad_px = cm_to_px(cfg.padding_cm, cfg.dpi)
-    jlog.info(f"Padding: {cfg.padding_cm} cm  ({pad_px} px at {cfg.dpi} dpi)")
+    pad_px = mm_to_px(cfg.padding_mm, cfg.dpi)
+    jlog.info(f"Padding: {cfg.padding_mm} mm  ({pad_px} px at {cfg.dpi} dpi)")
     jlog.info("=" * 55)
 
     # Render PDF pages
@@ -541,20 +542,23 @@ def process_pdf(
     pil_pages = []
     pdf_doc = pdfium.PdfDocument(str(input_path))
     scale = cfg.dpi / 72.0
-    for page in pdf_doc:
-        state = job_control.get("state", "running")
-        if state == "cancelled":
-            jlog.warning("Job cancelled during PDF rendering.")
-            return []
-        while job_control.get("state") == "paused":
-            time.sleep(0.5)
-            if job_control.get("state") == "cancelled":
+    try:
+        for page in pdf_doc:
+            state = job_control.get("state", "running")
+            if state == "cancelled":
                 jlog.warning("Job cancelled during PDF rendering.")
                 return []
-                
-        bitmap = page.render(scale=scale)
-        pil_pages.append(bitmap.to_pil())
-        
+            while job_control.get("state") == "paused":
+                time.sleep(0.5)
+                if job_control.get("state") == "cancelled":
+                    jlog.warning("Job cancelled during PDF rendering.")
+                    return []
+
+            bitmap = page.render(scale=scale)
+            pil_pages.append(bitmap.to_pil())
+    finally:
+        pdf_doc.close()   # release file handle so hot-folder can move the file on Windows
+
     jlog.info(f"  {len(pil_pages)} page(s) rendered in {time.time() - t0:.1f}s")
 
     results: List[PageResult] = []
@@ -565,7 +569,8 @@ def process_pdf(
 
     from concurrent.futures import FIRST_COMPLETED, wait
 
-    # Process pages in parallel using multiple CPU cores.
+    # Process pages in parallel — use all available cores minus 2 to keep
+    # the system responsive while still maximising throughput.
     total_cores = os.cpu_count() or 4
     num_workers = max(1, total_cores - 2)
     jlog.info(f"Using {num_workers} worker process(es) out of {total_cores} available")
@@ -642,8 +647,19 @@ def process_pdf(
     ok_paths = [r.output_path for r in results if r.success]
 
     if cfg.output_format in ("pdf", "both") and ok_paths:
-        out_pdf = out_dir / f"{input_path.stem}_cleaned.pdf"
+        pdf_stem = output_stem if output_stem else input_path.stem
+        out_pdf = out_dir / f"{pdf_stem}_cleaned.pdf"
         assemble_pdf(ok_paths, out_pdf, jlog)
+
+    # Clean up intermediate page images — they are only needed for PDF assembly.
+    # The final PDF (and any debug images) are kept; raw page files are deleted.
+    if cfg.output_format in ("pdf", "both") and pages_dir.exists():
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(str(pages_dir))
+            jlog.info(f"  Temp page images removed ({pages_dir.name}/)")
+        except Exception as _e:
+            jlog.warning(f"  Could not remove temp pages dir: {_e}")
 
     # Summary
     ok_count = sum(1 for r in results if r.success)
@@ -673,11 +689,11 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Skew detection algorithm")
     p.add_argument("--max-skew", type=float, default=15.0,
                    help="Maximum plausible skew angle in degrees")
-    p.add_argument("--padding-cm", type=float, default=2.0,
-                   help="Uniform white border added to each side (centimetres)")
-    p.add_argument("--output-format", choices=["pdf", "images", "both"], default="both",
+    p.add_argument("--padding-mm", type=float, default=10.0,
+                   help="Uniform white border added to each side (millimetres)")
+    p.add_argument("--output-format", choices=["pdf", "images", "both"], default="pdf",
                    help="What to produce")
-    p.add_argument("--image-format", choices=["png", "jpg", "tiff"], default="png",
+    p.add_argument("--image-format", choices=["png", "jpg", "tiff"], default="jpg",
                    help="Format for individual page images")
     p.add_argument("--jpeg-quality", type=int, default=85,
                    help="JPEG quality 1-100 (used when image-format is jpg)")
@@ -692,7 +708,7 @@ def main():
         dpi           = args.dpi,
         skew_method   = args.skew_method,
         max_skew_deg  = args.max_skew,
-        padding_cm    = args.padding_cm,
+        padding_mm    = args.padding_mm,
         output_format = args.output_format,
         image_format  = args.image_format,
         jpeg_quality  = args.jpeg_quality,

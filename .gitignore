@@ -18,3 +18,8 @@ input_images
 output_results
 
 *.png
+uploads/
+
+hot/input/*
+hot/output/*
+hot/processed/*

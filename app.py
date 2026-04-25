@@ -25,6 +25,7 @@ from pathlib import Path
 from flask import (
     Flask,
     Response,
+    after_this_request,
     jsonify,
     redirect,
     render_template_string,
@@ -48,9 +49,34 @@ logging.basicConfig(
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024   # 500 MB upload limit
 
-WORK_ROOT = Path(tempfile.mkdtemp(prefix="koba_scanner_"))
+BASE_DIR  = Path(__file__).parent
+WORK_ROOT = BASE_DIR / "uploads"
+WORK_ROOT.mkdir(exist_ok=True)
 JOBS: dict[str, dict] = {}   # job_id → state dict
 log = logging.getLogger("scanner.web")
+
+JOB_MAX_AGE_HOURS = 24   # job dirs older than this are removed on startup
+
+
+def _cleanup_old_jobs(max_age_hours: int = JOB_MAX_AGE_HOURS) -> None:
+    """Remove upload job directories that are older than max_age_hours.
+    Called once at startup so the uploads/ folder stays lean."""
+    import time as _time
+    cutoff = _time.time() - max_age_hours * 3600
+    removed = 0
+    for child in WORK_ROOT.iterdir():
+        if child.is_dir():
+            try:
+                if child.stat().st_mtime < cutoff:
+                    shutil.rmtree(str(child))
+                    removed += 1
+            except Exception:
+                pass
+    if removed:
+        log.info(f"Startup cleanup: removed {removed} old job folder(s) from uploads/")
+
+
+_cleanup_old_jobs()   # run once at import time
 
 job_queue = queue.Queue()
 
@@ -320,8 +346,6 @@ select:focus, input:focus { border-color: #c9542a; }
         <select id="s-dpi">
           <option value="200">200 — Fast preview</option>
           <option value="300" selected>300 — Recommended</option>
-          <option value="400">400 — High quality</option>
-          <option value="600">600 — Archival</option>
         </select>
       </div>
 
@@ -343,18 +367,18 @@ select:focus, input:focus { border-color: #c9542a; }
       </div>
 
       <div>
-        <label>Border Padding: <span id="pad-val">2.0</span> cm</label>
+        <label>Border Padding: <span id="pad-val">10</span> mm</label>
         <div class="range-row">
-          <input type="range" id="s-padding" min="0" max="5" step="0.5" value="2"
-                 oninput="document.getElementById('pad-val').textContent=parseFloat(this.value).toFixed(1)">
+          <input type="range" id="s-padding" min="0" max="50" step="1" value="10"
+                 oninput="document.getElementById('pad-val').textContent=this.value">
         </div>
       </div>
 
       <div>
         <label>Output Format</label>
         <select id="s-outfmt">
-          <option value="both">PDF + individual images</option>
           <option value="pdf" selected>PDF only</option>
+          <option value="both">PDF + individual images</option>
           <option value="images">Images only</option>
         </select>
       </div>
@@ -362,13 +386,13 @@ select:focus, input:focus { border-color: #c9542a; }
       <div>
         <label>Image Format</label>
         <select id="s-imgfmt" onchange="document.getElementById('jpeg-quality-container').style.display = this.value === 'jpg' ? 'block' : 'none'">
-          <option value="png" selected>PNG (lossless)</option>
-          <option value="jpg">JPEG (smaller)</option>
+          <option value="jpg" selected>JPEG (smaller)</option>
+          <option value="png">PNG (lossless)</option>
           <option value="tiff">TIFF (archival)</option>
         </select>
       </div>
 
-      <div id="jpeg-quality-container" style="display:none">
+      <div id="jpeg-quality-container" style="display:block">
         <label>JPEG Quality: <span id="jq-val">85</span>%</label>
         <div class="range-row">
           <input type="range" id="s-jq" min="10" max="100" value="85"
@@ -489,7 +513,7 @@ async function startJob() {
   fd.append('dpi',        document.getElementById('s-dpi').value);
   fd.append('method',     document.getElementById('s-method').value);
   fd.append('max_skew',   document.getElementById('s-maxskew').value);
-  fd.append('padding_cm', document.getElementById('s-padding').value);
+  fd.append('padding_mm', document.getElementById('s-padding').value);
   fd.append('out_format', document.getElementById('s-outfmt').value);
   fd.append('img_format', document.getElementById('s-imgfmt').value);
   fd.append('jpeg_quality', document.getElementById('s-jq').value);
@@ -677,7 +701,8 @@ def _run_job_sync(job_id: str) -> None:
             job["cfg"], 
             progress_cb=progress_cb,
             job_control=job,
-            log_cb=log_cb
+            log_cb=log_cb,
+            output_stem=job.get("original_stem"),
         )
 
         if job.get("state") == "cancelled":
@@ -735,6 +760,9 @@ def api_upload():
     job_dir = WORK_ROOT / job_id
     job_dir.mkdir(parents=True)
 
+    # Keep the original filename stem so output PDFs are named after the source.
+    original_stem = Path(f.filename).stem
+
     pdf_path = job_dir / "input.pdf"
     f.save(str(pdf_path))
 
@@ -744,21 +772,22 @@ def api_upload():
         dpi           = int(request.form.get("dpi", 300)),
         skew_method   = request.form.get("method", "projection"),
         max_skew_deg  = float(request.form.get("max_skew", 15)),
-        padding_cm    = float(request.form.get("padding_cm", 2.0)),
+        padding_mm    = float(request.form.get("padding_mm", 10.0)),
         output_format = request.form.get("out_format", "pdf"),
-        image_format  = request.form.get("img_format", "png"),
+        image_format  = request.form.get("img_format", "jpg"),
         jpeg_quality  = int(request.form.get("jpeg_quality", 85)),
         save_debug    = request.form.get("debug", "0") == "1",
     )
 
     JOBS[job_id] = {
-        "state":       "queued",
-        "done_pages":  0,
-        "total_pages": 0,
-        "log":         [],
-        "pdf_path":    str(pdf_path),
-        "out_dir":     out_dir,
-        "cfg":         cfg,
+        "state":         "queued",
+        "done_pages":    0,
+        "total_pages":   0,
+        "log":           [],
+        "pdf_path":      str(pdf_path),
+        "out_dir":       out_dir,
+        "cfg":           cfg,
+        "original_stem": original_stem,
     }
 
     job_queue.put(job_id)
@@ -791,8 +820,9 @@ def api_status(job_id: str):
     job = JOBS.get(job_id)
     if job is None:
         return jsonify(error="Job not found"), 404
-    # Return everything except the internal output_pdf path
-    safe = {k: v for k, v in job.items() if k != "output_pdf"}
+    # Return public fields only; exclude internal/non-serialisable keys
+    _internal = {"output_pdf", "cfg", "original_stem"}
+    safe = {k: v for k, v in job.items() if k not in _internal}
     return jsonify(safe)
 
 
@@ -804,6 +834,21 @@ def api_download(job_id: str):
     pdf_path = job.get("output_pdf")
     if not pdf_path or not Path(pdf_path).exists():
         return jsonify(error="PDF not found"), 404
+
+    job_dir = Path(WORK_ROOT) / job_id
+
+    @after_this_request
+    def _cleanup(response):
+        """Delete the job working directory after the file has been streamed."""
+        try:
+            if job_dir.exists():
+                shutil.rmtree(str(job_dir))
+                log.info(f"Job {job_id[:8]}…: working dir deleted after download")
+            JOBS.pop(job_id, None)
+        except Exception as e:
+            log.warning(f"Could not clean up job dir after download: {e}")
+        return response
+
     return send_file(
         pdf_path,
         as_attachment=True,
@@ -817,10 +862,13 @@ def api_download(job_id: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
-
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n[Koba] Document scanner")
-    print(f"   -> http://localhost:{port}\n")
+    print(f"")
+    print(f"  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
+    print(f"  ┃  🏛️  Koba Document Scanner              ┃")
+    print(f"  ┃  ➡  http://localhost:{port:<31}┃")
+    print(f"  ┃  📂  Uploads stored in: uploads/          ┃")
+    print(f"  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
+    print(f"")
     # use_reloader=False is important when background threads are in play
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
