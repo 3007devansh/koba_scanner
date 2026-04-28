@@ -23,3 +23,7 @@ uploads/
 hot/input/*
 hot/output/*
 hot/processed/*
+
+.claude
+venv
+Softeware ke liye testing ke liye pages

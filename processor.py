@@ -290,40 +290,18 @@ def make_lab_mask(img: np.ndarray) -> np.ndarray:
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     return mask
 
-def make_hsv_mask(img: np.ndarray) -> np.ndarray:
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    _, S, _ = cv2.split(hsv)
-    # Saturation threshold isolates colored objects from gray backgrounds
-    blurred = cv2.GaussianBlur(S, (11, 11), 0)
-    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel = np.ones((21, 21), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    return mask
-
 def find_content_bbox(
     cv_img: np.ndarray, cfg: Config
 ) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[np.ndarray]]:
     """
-    Find bounding box and convex hull using Contour method on an HSV mask (with LAB fallback).
+    Find bounding box and convex hull using Contour method on a LAB mask.
     """
     h_img, w_img = cv_img.shape[:2]
     page_size = h_img * w_img
 
-    mask_hsv = make_hsv_mask(cv_img)
-    mask = mask_hsv
-    
-    # Extract contour
+    mask = make_lab_mask(cv_img)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Fallback to LAB if HSV contour fails or if area is extremely small
     valid = [c for c in contours if 0.005 < (cv2.contourArea(c) / page_size) < 0.98]
-    
-    if not valid:
-        # Fallback triggered
-        mask_lab = make_lab_mask(cv_img)
-        mask = mask_lab
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid = [c for c in contours if 0.005 < (cv2.contourArea(c) / page_size) < 0.98]
 
     if not valid:
         return None, None
